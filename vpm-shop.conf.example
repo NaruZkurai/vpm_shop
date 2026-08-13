@@ -1,0 +1,25 @@
+# VPM shop configuration (sourced by systemd + launch.sh)
+# Copy to vpm-shop.conf and adjust for your environment.
+# Never commit the real vpm-shop.conf (it contains your URLs/credentials).
+
+# Where the VPM shop packages live on disk
+VPM_SHOP=/path/to/your/shop
+
+# Absolute path to the VCC manifest validator DLL
+VALIDATOR=/opt/vpm-upload-api/validator/vpmval.dll
+
+# Public base URL of the package registry (no trailing slash)
+MASTER_HOST=https://vpm.example.com
+
+# Upload API bind address
+BIND=0.0.0.0:55555
+
+# Default author name stamped into uploaded package.json files
+PKG_AUTHOR=VPM Shop
+
+# Logging filter
+RUST_LOG=info
+
+# Upload credentials are set in the systemd unit / environment, e.g.:
+#   API_USER=admin
+#   API_PASS=changeme

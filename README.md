@@ -1,95 +1,53 @@
-# vpm-login-api
+# vpm_shop
 
-A tiny Rust (`axum`) HTTP/HTTPS API that behaves like a "deny everything"
-endpoint:
+Rust (axum) upload API and web UI for a self-hosted **VPM (VRChat Package Manager)** shop.
 
-- **Every** request — any path, any method — returns HTTP `401 Not Authorised`.
-- The client IP is **logged** to `logs/access.log` (and the console).
-- The same IP is **included in the JSON error body**.
+This is the **system** repository — the server application itself. It contains **no packages, no unitypackage files, and no personal data**. Uploaded packages live in the shop directory (`VPM_SHOP`), not in this repo.
 
-## Response
+## Features
 
-```http
-HTTP/1.1 401 Unauthorized
-content-type: application/json
-
-{
-  "error": {
-    "code": "not authorised",
-    "ip": "127.0.0.1"
-  }
-}
-```
+- **Upload API** (`POST /upload`): multipart uploads of `.unitypackage`, `.zip`, or raw files. Auth via `API_USER`/`API_PASS` form fields.
+  - Auto-builds deterministic VPM zips (package.json + assets).
+  - Auto-versioning: existing versions become `<version>-rc.<N>` unless a demote/RC slot is requested.
+  - Validates every build against the real VCC manifest DLL (`VALIDATOR`).
+  - Regenerates the master `vpm-repo.json` and category repos after each upload.
+- **REST APIs**: package listing, file trees, file contents, package.json, dependencies (read + edit), version deletion, and a password-protected checklist.
+- **Web UI**: dark-mode single-page app with Browse + Upload tabs, folder tree file viewer, and package.json viewer.
 
 ## Configuration
 
-Environment variables (also supported via `.env`, see `.env.example`):
+Copy `vpm-shop.conf.example` to `vpm-shop.conf` and fill in your values:
 
-| Variable      | Default                    | Description                                      |
-| ------------- | -------------------------- | ------------------------------------------------ |
-| `PORT`        | `2095` / `2096` (with TLS) | Port to bind. Defaults to unused Cloudflare-proxyable ports. |
-| `USE_TLS`     | `0`                        | `1`/`true` to serve HTTPS instead of HTTP.       |
-| `TLS_CERT`    | `certs/server.crt`         | PEM certificate (auto-generated if missing).     |
-| `TLS_KEY`     | `certs/server.key`         | PEM private key (auto-generated if missing).     |
-| `ACCESS_LOG`  | `logs/access.log`          | File that receives one line per request + IP.    |
-| `RUST_LOG`    | `info`                     | Console logging filter.                          |
+| Variable      | Description                                              |
+|---------------|----------------------------------------------------------|
+| `VPM_SHOP`    | Where the VPM packages/shop live on disk                 |
+| `VALIDATOR`   | Absolute path to the VCC manifest validator DLL          |
+| `MASTER_HOST` | Public base URL of the registry (no trailing slash)      |
+| `BIND`        | Listen address, e.g. `0.0.0.0:55555`                     |
+| `API_USER`    | Upload username (can also be set via env/systemd)        |
+| `API_PASS`    | Upload password (can also be set via env/systemd)        |
+| `PKG_AUTHOR`  | Default author name stamped into uploaded package.json   |
+| `RUST_LOG`    | Tracing filter (default `info`)                          |
 
-## Run
+`vpm-shop.conf` is gitignored — never commit real URLs or credentials.
 
-```bash
-cargo run            # HTTP on :2095 (Cloudflare proxyable, no root needed)
-USE_TLS=1 cargo run  # HTTPS on :2096 (Cloudflare proxyable, no root needed)
+## Build & run
+
+```sh
+./build.sh            # release build -> target/release/vpm-upload-api
+./launch.sh           # run in foreground
+./launch.sh --background
 ```
 
-Test it:
+Or via systemd with `EnvironmentFile=/path/to/vpm-shop.conf`.
 
-```bash
-curl -i http://127.0.0.1:2095/anything
-curl -i -X POST http://127.0.0.1:2095/login
-curl -ki https://127.0.0.1:2096/   # -k ignores the self-signed cert
-```
+## Endpoints
 
-## Scripts
-
-```bash
-./build.sh            # release build -> target/release/vpm-login-api
-./build.sh --debug    # debug build   -> target/debug/vpm-login-api
-
-./launch.sh                 # run in foreground (builds first if needed)
-./launch.sh --background    # run in background, console logs -> logs/api.log
-```
-
-`launch.sh` reads the same env vars / `.env` as the binary itself.
-
-## Cloudflare
-
-With Cloudflare's proxy enabled (orange cloud), the edge only forwards to these
-origin ports:
-
-| HTTP origin ports  | HTTPS origin ports  |
-| ------------------ | ------------------- |
-| `80`, `8080`, `8880`, `2052`, `2082`, `2086`, `2095` | `443`, `2053`, `2083`, `2087`, `2096`, `8443` |
-
-This machine already has `80`, `8080`, `443`, and `8443` taken by other services,
-so the API defaults to the next Cloudflare-proxyable pair: `2095` (HTTP) and
-`2096` (HTTPS) — both above `1024`, so **no root required**.
-
-- SSL mode **Flexible** → plain HTTP origin on `2095` (default).
-- SSL mode **Full / Full (strict)** → HTTPS origin on `2096` with `USE_TLS=1` and a
-  real certificate at `TLS_CERT`/`TLS_KEY`.
-
-You can switch to any other port in the tables above via `PORT` (e.g. `8880` for
-HTTP or `2053` for HTTPS). Only `80`/`443` require root/setcap, e.g.
-`sudo setcap cap_net_bind_service=+ep target/debug/vpm-login-api`.
-
-Every response is `401` with `{"error":{"code":"not authorised","ip":"<client ip>"}}`,
-and the IP is appended to `logs/access.log`.
-
-## Notes
-
-- Client IP resolution prefers the `X-Forwarded-For` / `X-Real-IP` headers (set by
-  reverse proxies such as nginx, caddy, cloudflare). **If you expose this directly
-  to the internet, those headers are spoofable** — either use them only behind a
-  trusted proxy, or remove the proxy-header handling and rely on the TCP peer address.
-- For production TLS, drop your real certificate/key at `TLS_CERT`/`TLS_KEY`; the
-  self-signed generation only runs when the files are missing.
+- `GET /` — web UI
+- `GET /health` — health check
+- `POST /upload` — upload & publish a package
+- `GET /api/packages` — list all packages
+- `GET /api/package/{name}/{version}/files|file|json|deps`
+- `POST /api/package/{name}/{version}/deps` — edit dependencies
+- `DELETE /api/delete/{name}/{version}` — delete a version
+- `GET/POST /api/checklist` — personal to-upload checklist (X-Api-Password header)

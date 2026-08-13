@@ -1,4 +1,11 @@
+# Build artifacts
 /target
+
+# Runtime logs
 /logs
-/certs
-.env
+
+# Config file with real URLs/credentials (use vpm-shop.conf.example as a template)
+/vpm-shop.conf
+
+# Personal to-upload notes / shop data — never commit
+/.checklist.json
