@@ -1,0 +1,16 @@
+[package]
+name = "vpm-login-api"
+version = "0.1.0"
+edition = "2021"
+description = "Always returns 401 not authorised, logs the client IP and echoes it back in the JSON body."
+
+[dependencies]
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+chrono = "0.4"
+dotenvy = "0.15"
+rcgen = "0.13"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
