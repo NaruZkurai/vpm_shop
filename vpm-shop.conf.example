@@ -16,7 +16,7 @@ MASTER_HOST=https://localhost:55555
 BIND=0.0.0.0:55555
 
 # Default author name stamped into uploaded package.json files
-PKG_AUTHOR=VPM Shop
+PKG_AUTHOR="VPM Shop"
 
 # Logging filter
 RUST_LOG=info
