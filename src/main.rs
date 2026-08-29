@@ -93,6 +93,7 @@ async fn main() {
         .route("/api/package/{name}/{version}/json", get(api_package_json))
         .route("/api/package/{name}/{version}/deps", get(api_package_deps))
         .route("/api/package/{name}/{version}/deps", post(api_set_deps))
+        .route("/api/package/{name}/{version}/convert-to-dep", get(api_convert_to_vpm_dep))
         .route("/api/delete/{name}/{version}", get(delete_version))
         .route("/api/checklist", get(api_checklist_get))
         .route("/api/checklist", post(api_checklist_save))
@@ -578,23 +579,113 @@ async fn api_package_deps(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct ConvertQuery { path: String }
+
+async fn api_convert_to_vpm_dep(
+    State(cfg): State<Arc<Config>>,
+    AxumPath((name, version)): AxumPath<(String, String)>,
+    Query(q): Query<ConvertQuery>,
+) -> Response {
+    let path = q.path;
+    let folder_name = path.split('/').last().unwrap_or(&path);
+    match run_convert_to_vpm_dep(&cfg, &name, &version, &path, &folder_name) {
+        Ok(msg) => json_response(json!({ "ok": true, "message": msg })),
+        Err(e) => err_response(&format!("{e:#}")),
+    }
+}
+
+fn run_convert_to_vpm_dep(cfg: &Config, name: &str, version: &str, path: &str, folder_name: &str) -> Result<String> {
+    let zip_path = find_zip(cfg, name, version)?;
+    let work_dir = scratch_dir("convert");
+    let out_dir = work_dir.join("out");
+    fs::create_dir_all(&out_dir)?;
+
+    // Read the original package.json so we can preserve category/url/metadata.
+    let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path)?)?;
+    let orig_pkg_json: Value = {
+        let mut e = archive
+            .by_name("package.json")
+            .map_err(|e| anyhow!("no package.json in zip: {e}"))?;
+        let mut buf = Vec::new();
+        e.read_to_end(&mut buf)?;
+        serde_json::from_slice(&buf).unwrap_or_else(|_| json!({}))
+    };
+
+    // Extract every file except the folder (and its subtree) being converted and
+    // except package.json (build_zip writes that itself).
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let entry_name = entry.name().to_string();
+        if entry.is_dir()
+            || entry_name == "package.json"
+            || entry_name.is_empty()
+            || entry_name.split('/').any(|s| s == "..")
+            || entry_name == path
+            || entry_name.starts_with(&format!("{path}/"))
+        {
+            continue;
+        }
+        let dest = out_dir.join(&entry_name);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut f = fs::File::create(&dest)?;
+        io::copy(&mut entry, &mut f)?;
+    }
+
+    // Rebuild the zip in place (over the served file) with the folder removed.
+    build_zip(&out_dir, &zip_path, &orig_pkg_json)?;
+    let zip_sha = sha256_file(&zip_path)?;
+
+    // Update repo.json: attach the converted folder as a VPM dependency.
+    let repo_path = cfg.shop.join("vpm-repo.json");
+    let txt = fs::read_to_string(&repo_path)?;
+    let mut repo: Value = serde_json::from_str(&txt)?;
+    let pkg = repo["packages"][name].as_object_mut().ok_or_else(|| anyhow!("package not found"))?;
+    let ver_entry = pkg["versions"][version].as_object_mut().ok_or_else(|| anyhow!("version not found"))?;
+
+    let vpm_deps = ver_entry.get("vpmDependencies").cloned().unwrap_or_else(|| json!({}));
+    let mut vpm_deps_map = match vpm_deps.as_object() {
+        Some(m) => m.clone(),
+        None => serde_json::Map::new(),
+    };
+    vpm_deps_map.insert(folder_name.to_string(), json!("1.0.0"));
+    ver_entry["vpmDependencies"] = json!(vpm_deps_map);
+    ver_entry["zipSHA256"] = json!(zip_sha);
+
+    let tmp_repo = repo_path.with_extension("json.tmp");
+    fs::write(&tmp_repo, serde_json::to_string_pretty(&repo)?)?;
+    fs::rename(&tmp_repo, &repo_path)?;
+
+    run_regen(&cfg.shop)?;
+    let _ = run_cmd("dotnet", &["--manifest", &cfg.shop.join("VPM/vpm-repo.json").to_string_lossy()]).with_context(|| "validation failed")?;
+
+    let _ = fs::remove_dir_all(&work_dir);
+    Ok(format!("converted folder '{path}' to VPM dependency '{folder_name}'"))
+}
+
+#[derive(serde::Deserialize)]
+struct SetDepsBody {
+    #[serde(default)]
+    dependencies: Value,
+    #[serde(default)]
+    #[allow(non_snake_case)]
+    vpmDependencies: Value,
+}
+
 async fn api_set_deps(
     State(cfg): State<Arc<Config>>,
     AxumPath((name, version)): AxumPath<(String, String)>,
-    axum::Json(body): axum::Json<Value>,
+    axum::Json(body): axum::Json<SetDepsBody>,
 ) -> Response {
-    let deps = body
-        .get("dependencies")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let vpm_deps = body
-        .get("vpmDependencies")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if !deps.is_object() || !vpm_deps.is_object() {
-        return err_response("dependencies and vpmDependencies must be JSON objects");
-    }
-    match run_set_deps(&cfg, &name, &version, &deps, &vpm_deps) {
+    match run_set_deps(
+        &cfg,
+        &name,
+        &version,
+        &body.dependencies,
+        &body.vpmDependencies,
+    ) {
         Ok(msg) => json_response(json!({ "ok": true, "message": msg })),
         Err(e) => err_response(&format!("{e:#}")),
     }
@@ -979,7 +1070,7 @@ async fn run_upload(
     };
     Ok(format!(
         "{demote_note}{bump_note}Package <b>{name}</b> v{version} uploaded and published.<br>\
-         <b>Zip:</b> <a href=\"{zip_url}\">{zip_url}</a><br>\
+         <b>Zip:</b> <a href=\"{zip_url}\">{name}</a><br>\
          <b>Master repo:</b> <a href=\"{repo_url}\">{repo_url}</a><br>\
          <b>zipSHA256:</b> <code>{zip_sha}</code><br>\
          <hr><b>Manifest validation (VCC DLL):</b><br><pre>{man_val}</pre>\
@@ -1334,9 +1425,9 @@ header .sub { color:var(--muted); font-size:12px; margin-top:2px; }
 .tabs { display:flex; gap:6px; margin-left:auto; }
 .tab { padding:6px 14px; border:1px solid var(--border); border-radius:6px; background:var(--bg3); color:var(--muted); cursor:pointer; font-size:13px; }
 .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-main { width:100%; max-width:none; margin:0 auto; padding:16px 20px; box-sizing:border-box; }
-.card { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:20px; margin-bottom:20px; }
-.card h2 { margin:0 0 14px; font-size:16px; }
+main { width:100%; max-width:none; margin:0 auto; padding:4px 8px; box-sizing:border-box; }
+.card { display: flex; flex-direction: column; background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:4px 8px; margin-bottom:8px; }
+.card h2 { margin:0 0 8px; font-size:16px; }
 .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 @media(max-width:800px){ .grid{grid-template-columns:1fr;} }
 label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
@@ -1354,14 +1445,14 @@ button.ghost { background:transparent; border:1px solid var(--border); color:var
 .warn-box code { background:rgba(0,0,0,.35); padding:1px 5px; border-radius:4px; }
 .layout { display:grid; grid-template-columns:300px 1fr; gap:20px; }
 @media(max-width:900px){ .layout{grid-template-columns:1fr;} }
-.pkg-list { max-height:70vh; overflow-y:auto; }
-.pkg-item { padding:10px 12px; border:1px solid var(--border); border-radius:6px; margin-bottom:8px; cursor:pointer; background:var(--bg); }
+.pkg-list { flex: 1; overflow-y: auto; }
+.pkg-item { padding:6px 8px; border:1px solid var(--border); border-radius:4px; margin-bottom:4px; cursor:pointer; background:var(--bg); }
 .pkg-item:hover { border-color:var(--accent); }
 .pkg-item.active { border-color:var(--accent); background:var(--bg3); }
 .pkg-item .nm { font-weight:600; font-size:13px; }
-.pkg-item .meta { font-size:11px; color:var(--muted); margin-top:2px; }
+.pkg-item .meta { font-size:10px; color:var(--muted); margin-top:0; }
 .pkg-item .cat { display:inline-block; padding:1px 7px; border-radius:10px; background:var(--bg3); color:var(--accent); font-size:10px; }
-.files { border:1px solid var(--border); border-radius:6px; overflow:hidden; max-height:45vh; overflow-y:auto; }
+.files { border:1px solid var(--border); border-radius:6px; }
 .files .frow { padding:6px 12px; font-family:var(--mono); font-size:12px; cursor:pointer; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; gap:10px; }
 .files .frow:hover { background:var(--bg3); }
 .files .frow.selected { background:#1f3a5f; }
@@ -1372,10 +1463,10 @@ button.ghost { background:transparent; border:1px solid var(--border); color:var
 .files .fdir .caret { font-size:9px; color:var(--muted); width:12px; display:inline-block; }
 .files .tree-sub { flex-basis:100%; margin-left:6px; padding-left:8px; border-left:1px dashed var(--border); }
 #viewer { margin-top:14px; }
-#viewer pre { background:#010409; border:1px solid var(--border); border-radius:6px; padding:14px; overflow:auto; font-family:var(--mono); font-size:12.5px; max-height:50vh; }
+#viewer pre { background:#010409; border:1px solid var(--border); border-radius:6px; padding:8px; overflow:auto; font-family:var(--mono); font-size:12px; max-height:50vh; text-align:left; }
 #viewer .fhead { font-family:var(--mono); font-size:12px; color:var(--muted); margin-bottom:6px; }
 .hidden { display:none !important; }
-.pkg-detail-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+.pkg-detail-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
 .pkg-detail-head h3 { margin:0; font-size:17px; word-break:break-all; }
 .badge { font-size:11px; padding:2px 8px; border-radius:10px; background:var(--bg3); color:var(--muted); }
 .version-list { border:1px solid var(--border); border-radius:6px; margin-bottom:14px; overflow:hidden; }
@@ -1391,7 +1482,7 @@ button.ghost { background:transparent; border:1px solid var(--border); color:var
 .pkg-json-head { display:flex; align-items:center; gap:8px; padding:7px 12px; cursor:pointer; font-size:12px; color:var(--muted); background:var(--bg3); font-family:var(--mono); }
 .pkg-json-head:hover { color:var(--text); }
 .pkg-json-caret { width:12px; text-align:center; }
-.pkg-json-content { margin:0; padding:10px 12px; font-family:var(--mono); font-size:11px; line-height:1.5; max-height:26vh; overflow:auto; white-space:pre; }
+.pkg-json-content { margin:0; padding:4px 8px; font-family:var(--mono); font-size:10px; line-height:1.3; max-height:24vh; overflow:auto; white-space:pre; text-align:left; }
 .deps-toggle { padding:2px 8px; font-size:12px; }
 .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
 .toolbar input { flex:1; }
@@ -1401,7 +1492,7 @@ button.ghost { background:transparent; border:1px solid var(--border); color:var
 .modal-head { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
 .modal-head h2 { margin:0; font-size:17px; }
 .add-ver { padding:2px 9px; font-size:12px; margin-left:8px; }
-.deps-card { padding:12px; margin-bottom:14px; }
+.deps-card { padding:8px; margin-bottom:14px; }
 .deps-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
 .deps-title { font-size:13px; font-weight:600; }
 .deps-count { font-size:11px; background:var(--bg3); border-radius:10px; padding:1px 8px; color:var(--muted); }
@@ -1425,7 +1516,7 @@ a { color:var(--accent); text-decoration:none; }
 <header>
   <div>
     <h1>🛒 VPM Shop Manager</h1>
-    <div class="sub">upload · browse · inspect registry</div>
+    <div class="sub"> <button class="ghost" id="btn-nav-upload" onclick="openUploadModal()">upload</button> · <button class="ghost" id="btn-nav-browse" onclick="loadPackages()">browse</button> · <button class="ghost" id="btn-nav-registry" onclick="showRegistry()">inspect registry</button> · <button class="ghost" id="btn-nav-vault" onclick="openVault()">vault</button> </div>
   </div>
   <div class="tabs">
     <button class="tab active" data-tab="browse">Browse</button>
@@ -1529,6 +1620,8 @@ a { color:var(--accent); text-decoration:none; }
   </div>
 </main>
 <script>
+const repoUrl = 'https://vpm.example.com';
+const vaultUrl = 'https://vault.example.com';
 const $ = s => document.querySelector(s);
 let PACKAGES = {};
 let currentPkg = null, currentVer = null;
@@ -1692,7 +1785,7 @@ function renderList() {
     const cat = v && v.category ? v.category : 'Misc';
     const div = document.createElement('div');
     div.className = 'pkg-item' + (nm === currentPkg ? ' active' : '');
-    div.innerHTML = `<div class="nm">${esc(nm)}<button class="ghost add-ver" title="Add a new version" type="button">+ ver</button></div>
+    div.innerHTML = `<div class="nm"><button class="ghost add-ver" title="Add a new version" type="button">+ ver</button> ${esc(nm)}</div>
       <div class="meta"><span class="cat">${esc(cat)}</span> · ${vers.length} version${vers.length>1?'s':''} · latest ${esc(vers[vers.length-1]||'')}</div>`;
     div.onclick = () => selectPackage(nm);
     div.querySelector('.add-ver').onclick = (e) => { e.stopPropagation(); openUploadModal(nm); };
@@ -1730,9 +1823,9 @@ async function selectVersion(ver) {
     </div>`).join('');
   d.innerHTML = `
     <div class="pkg-detail-head">
+      <button class="ghost" id="btn-addver">+ Add version</button>
       <h3>${esc(currentPkg)}</h3>
       <span class="badge">${esc(cat)}</span>
-      <button class="ghost" id="btn-addver">+ Add version</button>
       <button class="danger" id="btn-del" style="margin-left:auto">Delete v${esc(ver)}</button>
     </div>
     <div class="pkg-json" id="pkg-json-block">
@@ -1783,7 +1876,7 @@ function renderFileTree(files) {
   }
   const rootEl = document.createElement('div');
   rootEl.className = 'files tree';
-  const build = (obj, depth, parent) => {
+  let build = (obj, depth, parent, rel_path) => {
     for (const k of Object.keys(obj).sort()) {
       const v = obj[k];
       const row = document.createElement('div');
@@ -1800,22 +1893,34 @@ function renderFileTree(files) {
         row.onclick = (e) => { e.stopPropagation(); viewFile(f.name, f.size); };
         parent.appendChild(row);
       } else {
+        const folderPath = rel_path ? rel_path + '/' + k : k;
         row.className = 'fdir';
-        row.innerHTML = `<span class="caret">▶</span><span>📁 ${esc(k)}</span>`;
+        row.dataset.path = folderPath;
+        row.innerHTML = `<span class="caret">▶</span><span>📁 ${esc(k)}</span><button class="convert-dep" title="Convert folder to a VPM dependency and remove it from the package" style="margin-left:4px; padding:0 4px; font-size:10px">+<span class="muted" style="font-size:8px">dep</span></button>`;
         const sub = document.createElement('div');
         sub.className = 'tree-sub hidden';
-        build(v, depth + 1, sub);
+        build(v, depth + 1, sub, folderPath);
         row.appendChild(sub);
         row.onclick = (e) => {
           e.stopPropagation();
           const hidden = sub.classList.toggle('hidden');
           row.querySelector('.caret').textContent = hidden ? '▶' : '▼';
         };
+        row.querySelector('.convert-dep').onclick = async (e) => {
+          e.stopPropagation();
+          const full = row.dataset.path;
+          const folderName = full.split('/').pop();
+          if (!confirm(`Convert folder '${folderName}' to a VPM dependency and remove it from ${currentPkg} v${currentVer}?`)) return;
+          const rr = await fetch(`/api/package/${encodeURIComponent(currentPkg)}/${encodeURIComponent(currentVer)}/convert-to-dep?path=${encodeURIComponent(full)}`);
+          const jj = await rr.json();
+          if (jj.ok) { showStatus(jj.message, true); selectVersion(currentVer); }
+          else showStatus(jj.error || 'convert failed', false);
+        };
         parent.appendChild(row);
       }
     }
   };
-  build(tree, 0, rootEl);
+  build(tree, 0, rootEl, "");
   container.appendChild(rootEl);
 }
 async function viewFile(path, size) {
@@ -1860,7 +1965,11 @@ function renderDeps(ver, deps, vpmDeps) {
       <div class="dep-head-row"><span>type</span><span>package</span><span></span><span>version</span><span></span></div>
       ${rows.length ? rows.map(r => rowHtml(r.sec, r.k, r.v)).join('')
         : `<div class="empty" style="padding:6px">No dependencies.</div>`}
-      <button class="ghost add-row" style="margin-top:6px;width:100%">+ add dependency</button>
+      <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px">
+      <button class="ghost add-row" style="width:100%">+ add by ID</button>
+      <button class="ghost add-row-dir" style="width:100%">+ add from dir</button>
+    </div>
+    <input type="file" id="deps-dir-input" style="display:none" webkitdirectory>
     </div>
   </div>`;
   const toggle = () => {
@@ -1876,6 +1985,21 @@ function renderDeps(ver, deps, vpmDeps) {
     if (empty) empty.remove();
     box.insertAdjacentHTML('beforeend', rowHtml('dependencies', '', ''));
     box.querySelector('.dep-row:last-child .dep-k').focus();
+  };
+  panel.querySelector('.add-row-dir').onclick = (e) => {
+    e.stopPropagation();
+    $('#deps-dir-input').click();
+  };
+  $('#deps-dir-input').onchange = (e) => {
+    const files = e.target.files || [];
+    if (!files.length) return;
+    // use the folder name (first path segment) as the dependency id
+    const folder = files[0].webkitRelativePath.split('/')[0];
+    const box = $('#deps-rows');
+    const empty = box.querySelector('.empty');
+    if (empty) empty.remove();
+    box.insertAdjacentHTML('beforeend', rowHtml('vpmDependencies', folder || '', '1.0.0'));
+    e.target.value = '';
   };
   $('#deps-save').onclick = async (e) => {
     e.stopPropagation();
@@ -1900,7 +2024,7 @@ function rowHtml(sec, k, v) {
     <select class="dep-sec">${sec === 'vpmDependencies'
       ? '<option value="dependencies">dependencies</option><option value="vpmDependencies" selected>vpmDependencies</option>'
       : '<option value="dependencies" selected>dependencies</option><option value="vpmDependencies">vpmDependencies</option>'}</select>
-    <input class="dep-k" value="${esc(k)}" placeholder="com.package.id" spellcheck="false">
+    <input class="dep-k" value="${esc(k)}" placeholder="com.package.id" spellcheck="false" title="Repo: ${esc(k)}">
     <span class="dep-arrow">→</span>
     <input class="dep-v" value="${esc(v)}" placeholder="1.0.0 or ^1.2.3">
     <button class="ghost dep-del" title="remove">✕</button>
@@ -2003,5 +2127,12 @@ $('#upload-form').addEventListener('submit', async (e) => {
 $('#pkg-search').addEventListener('input', renderList);
 
 loadPackages();
+
+function showRegistry() {
+  window.open(repoUrl, '_blank');
+}
+function openVault() {
+  window.open(vaultUrl, '_blank');
+}
 </script>
 </body></html>"#;
