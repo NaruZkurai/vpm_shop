@@ -9,3 +9,6 @@
 
 # Personal to-upload notes / shop data — never commit
 /.checklist.json
+
+# Local default shop dir (./mnt/shop) — package data, not source
+/mnt

@@ -9,7 +9,8 @@ VPM_SHOP=/path/to/your/shop
 VALIDATOR=/opt/vpm-upload-api/validator/vpmval.dll
 
 # Public base URL of the package registry (no trailing slash)
-MASTER_HOST=https://vpm.example.com
+#MASTER_HOST=https://vpm.example.com
+MASTER_HOST=https://localhost:55555
 
 # Upload API bind address
 BIND=0.0.0.0:55555

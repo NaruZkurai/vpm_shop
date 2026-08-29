@@ -1,7 +1,7 @@
 //! vpm-upload-api — standalone VPM shop upload service.
 //!
 //! POST /upload: multipart (username, password, name, version, category, file)
-//!   - validates creds (default CC / cc)
+//!   - validates creds from API_USER/API_PASS env (vpm-shop.conf)
 //!   - extracts the .unitypackage into VPM/<Category>/<dirname>/
 //!   - builds a deterministic VPM zip (package.json + assets)
 //!   - updates the master vpm-repo.json
@@ -28,18 +28,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
-const CATEGORIES: &[&str] = &[
-    "Avatars",
-    "BetterPB",
-    "Shaders",
-    "Tools",
-    "Props",
-    "Animations",
-    "Models3D",
-    "PointlessAssets",
-    "Misc",
-];
-
 #[derive(Clone)]
 struct Config {
     shop: PathBuf,
@@ -47,26 +35,102 @@ struct Config {
     username: String,
     password: String,
     master_host: String,
+    categories: Vec<String>,
+}
+
+/// The fallback category list, written to `<shop>/categories.txt` on first run
+/// so it can be edited by hand.
+fn default_categories() -> Vec<String> {
+    vec![
+        "Avatars".to_string(),
+        "BetterPB".to_string(),
+        "Shaders".to_string(),
+        "Tools".to_string(),
+        "Props".to_string(),
+        "Animations".to_string(),
+        "Models3D".to_string(),
+        "PointlessAssets".to_string(),
+        "Misc".to_string(),
+    ]
+}
+
+/// Read categories from `<shop>/categories.txt` (one per line), falling back to
+/// the built-in defaults when the file doesn't exist yet. Categories live in a
+/// file (not a const) so they're mutable at runtime.
+fn load_categories(shop: &Path) -> Result<Vec<String>> {
+    let path = shop.join("categories.txt");
+    if !path.exists() {
+        return Ok(default_categories());
+    }
+    let txt = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read categories file {}", path.display()))?;
+    let cats: Vec<String> = txt
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if cats.is_empty() {
+        bail!("categories file {} is empty", path.display());
+    }
+    Ok(cats)
+}
+
+/// Read `key` from the environment, falling back to `default`. The default is
+/// only ever a real path/URL baked into this repo — never a fabricated
+/// credential.
+fn env_or(key: &str, default: &str) -> String {
+    match env::var(key) {
+        Ok(v) => v,
+        Err(_) => default.to_string(),
+    }
 }
 
 impl Config {
-    fn from_env() -> Config {
-        let shop = PathBuf::from(
-            env::var("VPM_SHOP").unwrap_or_else(|_| "/mnt/data/sda2/shop".into()),
-        );
-        let validator = PathBuf::from(
-            env::var("VALIDATOR")
-                .unwrap_or_else(|_| "/opt/vpm-upload-api/validator/vpmval.dll".into()),
-        );
-        Config {
+    fn from_env() -> Result<Config> {
+        let shop = PathBuf::from(env_or("VPM_SHOP", "./mnt/shop"));
+        let validator = PathBuf::from(env_or("VALIDATOR", "./validator/vpmval.dll"));
+        let master_host = env_or("MASTER_HOST", "https://vpm.example.com");
+        // Credentials are NOT hardcoded. They must come from the environment
+        // (vmp-shop.conf, loaded by ./launch.sh, provides them).
+        let username = env::var("API_USER")
+            .context("API_USER is not set — run ./launch.sh to generate vpm-shop.conf")?;
+        let password = env::var("API_PASS")
+            .context("API_PASS is not set — run ./launch.sh to generate vpm-shop.conf")?;
+        let categories = load_categories(&shop)?;
+        Ok(Config {
             shop,
             validator,
-            username: env::var("API_USER").unwrap_or_else(|_| "CC".into()),
-            password: env::var("API_PASS").unwrap_or_else(|_| "cc".into()),
-            master_host: env::var("MASTER_HOST")
-                .unwrap_or_else(|_| "https://vpm.example.com".into()),
-        }
+            username,
+            password,
+            master_host,
+            categories,
+        })
     }
+}
+
+/// Create the shop dir + category subdirs and an empty master `vpm-repo.json`
+/// if they don't already exist, so a fresh local checkout (./mnt/shop) works
+/// without manual setup.
+fn bootstrap_shop(cfg: &Config) -> Result<()> {
+    fs::create_dir_all(&cfg.shop)?;
+    // Write the editable categories file on first run so it can be customized.
+    let cat_file = cfg.shop.join("categories.txt");
+    if !cat_file.exists() {
+        fs::write(&cat_file, default_categories().join("\n") + "\n")?;
+    }
+    for cat in &cfg.categories {
+        fs::create_dir_all(cfg.shop.join("VPM").join(cat))?;
+    }
+    let repo_path = cfg.shop.join("vpm-repo.json");
+    if !repo_path.exists() {
+        let init = json!({
+            "name": "VPM Shop",
+            "url": format!("{}/index.json", cfg.master_host.trim_end_matches('/')),
+            "packages": {}
+        });
+        fs::write(&repo_path, serde_json::to_string_pretty(&init)?)?;
+    }
+    Ok(())
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -82,7 +146,14 @@ fn scratch_dir(tag: &str) -> PathBuf {
 
 #[tokio::main]
 async fn main() {
-    let cfg = Arc::new(Config::from_env());
+    let cfg = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => panic!("{e:#}"),
+    };
+    if let Err(e) = bootstrap_shop(&cfg) {
+        panic!("failed to initialize shop dirs: {e:#}");
+    }
+    let cfg = Arc::new(cfg);
     let app = Router::new()
         .route("/", get(index))
         .route("/upload", post(upload))
@@ -97,6 +168,7 @@ async fn main() {
         .route("/api/delete/{name}/{version}", get(delete_version))
         .route("/api/checklist", get(api_checklist_get))
         .route("/api/checklist", post(api_checklist_save))
+        .route("/api/categories", get(api_categories))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024)) // 10 GiB ceiling
         .with_state(cfg);
 
@@ -108,13 +180,9 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
-}
+async fn index() -> Html<&'static str> { Html(INDEX_HTML) }
 
-async fn health() -> &'static str {
-    "ok"
-}
+async fn health() -> &'static str { "ok" }
 
 async fn upload(State(cfg): State<Arc<Config>>, mut mp: Multipart) -> Response {
     let mut username = None;
@@ -151,9 +219,7 @@ async fn upload(State(cfg): State<Arc<Config>>, mut mp: Multipart) -> Response {
                     Err(e) => return html_result(false, &format!("saving upload failed: {e}")),
                 }
             }
-            _ => {
-                let _ = field.bytes().await;
-            }
+            _ => { let _ = field.bytes().await; }
         }
     }
 
@@ -403,6 +469,10 @@ async fn api_packages(State(cfg): State<Arc<Config>>) -> Response {
         Ok(repo) => json_response(repo),
         Err(e) => err_response(&format!("{e:#}")),
     }
+}
+
+async fn api_categories(State(cfg): State<Arc<Config>>) -> Response {
+    json_response(json!(cfg.categories))
 }
 
 // ─── Private checklist (password-protected personal notes) ─────────────────
@@ -935,10 +1005,10 @@ async fn run_upload(
         // Re-uploads of an existing package inherit its current category.
         None => existing_category(cfg, &name)?.unwrap_or_else(|| "Misc".into()),
     };
-    if !CATEGORIES.contains(&category.as_str()) {
+    if !cfg.categories.contains(&category) {
         bail!(
             "invalid category '{category}' (choose from: {})",
-            CATEGORIES.join(", ")
+            cfg.categories.join(", ")
         );
     }
     for (fname, fpath) in &files {
@@ -1584,7 +1654,7 @@ a { color:var(--accent); text-decoration:none; }
         <div class="grid">
           <div>
             <label>Username</label>
-            <input name="username" placeholder="CC" autocomplete="username" required>
+            <input name="username" placeholder="username" autocomplete="username" required>
           </div>
           <div>
             <label>Password</label>
@@ -1602,11 +1672,7 @@ a { color:var(--accent); text-decoration:none; }
           </div>
           <div>
             <label>Category</label>
-            <select name="category" id="up-category">
-              <option>Avatars</option><option>BetterPB</option><option>Shaders</option>
-              <option>Tools</option><option>Props</option><option>Animations</option>
-              <option>Models3D</option><option>PointlessAssets</option><option selected>Misc</option>
-            </select>
+            <select name="category" id="up-category"><option>Misc</option></select>
           </div>
           <div>
             <label>Package file(s) <span style="color:var(--muted)">(unitypackage · zip · raw files)</span></label>
@@ -1755,6 +1821,17 @@ function openUploadModal(pkgName) {
 }
 function closeUploadModal() {
   $('#upload-modal').classList.add('hidden');
+}
+
+// ── categories (loaded from the server, which reads <shop>/categories.txt) ──
+async function loadCategories() {
+  try {
+    const r = await fetch('/api/categories');
+    if (!r.ok) return;
+    const cats = await r.json();
+    const sel = $('#up-category');
+    sel.innerHTML = cats.map(c => `<option${c === 'Misc' ? ' selected' : ''}>${esc(c)}</option>`).join('');
+  } catch { /* keep default Misc option */ }
 }
 
 // ── browse ──
@@ -2126,6 +2203,7 @@ $('#upload-form').addEventListener('submit', async (e) => {
 
 $('#pkg-search').addEventListener('input', renderList);
 
+loadCategories();
 loadPackages();
 
 function showRegistry() {
