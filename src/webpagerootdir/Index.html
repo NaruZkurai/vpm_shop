@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPM Shop Manager</title>
+<link rel="stylesheet" href="css/index.css">
+</head>
+<body>
+<header>
+  <div>
+    <h1>🛒 VPM Shop Manager</h1>
+    <div class="sub"> <button class="ghost" id="btn-nav-upload" onclick="openUploadModal()">upload</button> · <button class="ghost" id="btn-nav-browse" onclick="loadPackages()">browse</button> · <button class="ghost" id="btn-nav-registry" onclick="showRegistry()">inspect registry</button> · <button class="ghost" id="btn-nav-repos" onclick="openRepos()">repos</button> · <button class="ghost" id="btn-nav-vault" onclick="openVault()">vault</button> </div>
+  </div>
+  <div class="tabs">
+    <button class="tab active" data-tab="browse">Browse</button>
+    <button class="tab" data-tab="upload">Upload</button>
+    <button class="tab" data-tab="checklist">Checklist</button>
+    <button class="tab" data-tab="repos">Repos</button>
+  </div>
+</header>
+<main>
+  <div id="status"></div>
+
+  <!-- BROWSE TAB -->
+  <section id="tab-browse">
+    <div class="layout">
+      <div class="card">
+        <h2>Packages</h2>
+        <div class="toolbar">
+          <input id="pkg-search" type="search" name="pkg_search" placeholder="Filter packages…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" readonly onfocus="this.removeAttribute('readonly')">
+        </div>
+        <div class="pkg-list" id="pkg-list"></div>
+      </div>
+      <div class="card">
+        <div id="pkg-detail" class="empty">Select a package on the left to inspect it.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CHECKLIST TAB -->
+  <section id="tab-checklist" class="hidden">
+    <div class="card" style="max-width:640px">
+      <h2>📋 Upload Checklist</h2>
+      <div id="checklist-lock">
+        <p class="muted" style="margin:0 0 10px">Enter the password to view your private to-upload list.</p>
+        <div class="toolbar">
+          <input id="cl-password" type="password" placeholder="password" autocomplete="off">
+          <button id="cl-unlock">Unlock</button>
+        </div>
+        <div id="cl-lock-err" class="warn-box hidden"></div>
+      </div>
+      <div id="checklist-body" class="hidden">
+        <p class="muted" style="margin:0 0 4px">Things to upload — check them off as you go.</p>
+        <div id="cl-items"></div>
+        <div class="toolbar" style="margin-top:10px">
+          <input id="cl-new" type="text" placeholder="Add something to upload…" autocomplete="off">
+          <button class="ghost" id="cl-add">+ Add</button>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+          <button id="cl-save">💾 Save</button>
+          <button class="ghost" id="cl-clear-done">Clear done</button>
+          <span class="muted" id="cl-saved-hint" style="font-size:11px"></span>
+          <button class="ghost" id="cl-lock" style="margin-left:auto">🔒 Lock</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- REPOS TAB -->
+  <section id="tab-repos" class="hidden">
+    <div class="card" style="max-width:820px">
+      <h2>🗂 Repo metadata</h2>
+      <p class="muted" style="margin:0 0 4px">Edit the display name and URL id used by each category repo. Save writes <code>repos.conf</code> and regenerates the category listings.</p>
+      <div id="repos-msg" class="warn-box hidden"></div>
+      <div class="toolbar" style="margin-top:8px">
+        <button id="repos-save">💾 Save &amp; regen</button>
+        <span class="muted" id="repos-saved-hint" style="font-size:11px"></span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0">
+        <div><label>Master display name</label><input id="repos-master-name" autocomplete="off" spellcheck="false"></div>
+        <div><label>Master id</label><input id="repos-master-id" autocomplete="off" spellcheck="false"></div>
+      </div>
+      <div class="dep-head-row" style="display:grid;grid-template-columns:1fr 1.4fr 1.4fr;gap:6px">
+        <span>category</span><span>repo name</span><span>repo url-id</span>
+      </div>
+      <div id="repos-rows"></div>
+    </div>
+  </section>
+
+  <!-- UPLOAD MODAL -->
+  <div id="upload-modal" class="modal hidden">
+    <div class="modal-back" onclick="closeUploadModal()"></div>
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2>Upload package files</h2>
+        <button type="button" class="ghost" onclick="closeUploadModal()" style="margin-left:auto">✕</button>
+      </div>
+      <form id="upload-form" enctype="multipart/form-data">
+        <div class="grid">
+          <div>
+            <label>Username</label>
+            <input name="username" placeholder="username" autocomplete="username" required>
+          </div>
+          <div>
+            <label>Password</label>
+            <input name="password" type="password" placeholder="••••••" autocomplete="current-password" required>
+          </div>
+          <div>
+            <label>Package ID <span style="color:var(--muted)">(pick existing or type new)</span></label>
+            <input name="name" id="up-name" list="pkg-ids" placeholder="com.author.package" required autocomplete="off">
+            <datalist id="pkg-ids"></datalist>
+          </div>
+          <div>
+            <label>Version <span style="color:var(--muted)">(semver)</span></label>
+            <input name="version" id="up-version" list="pkg-versions" placeholder="1.0.0" required autocomplete="off">
+            <datalist id="pkg-versions"></datalist>
+          </div>
+          <div>
+            <label>Category</label>
+            <select name="category" id="up-category"><option>Misc</option></select>
+          </div>
+          <div>
+            <label>Package file(s) <span style="color:var(--muted)">(unitypackage · zip · raw files)</span></label>
+            <input type="file" name="file" accept=".unitypackage,.zip,.blend,.fbx,.obj,.png,.jpg,.jpeg,.gif,.mp3,.wav,.json,.txt,.unity,.prefab,.mat,.asset,.anim,.controller,.bundle" multiple required>
+          </div>
+        </div>
+        <div id="up-warn" class="warn-box hidden"></div>
+        <p style="margin-top:16px"><button type="submit">⬆ Upload files &amp; publish</button></p>
+      </form>
+    </div>
+  </div>
+</main>
+<script src="js/app.js"></script>
+</body></html>
