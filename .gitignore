@@ -15,3 +15,6 @@
 
 # Local default shop dir (./mnt/shop) — package data, not source
 /mnt
+
+# Compiled VCC validator (.NET) — build/deploy artifact, not source
+/validator
