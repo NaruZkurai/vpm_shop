@@ -53,15 +53,24 @@ if [[ ! -f "$CONF" ]]; then
 # Never commit this file (it holds your credentials/URLs).
 VPM_SHOP="${VPM_SHOP:-./mnt/shop}"
 VALIDATOR="${VALIDATOR:-./validator/vpmval.dll}"
-MASTER_HOST="${MASTER_HOST:-https://vpm.example.com}"
+MASTER_HOST="${MASTER_HOST:-}"
 BIND="${BIND:-0.0.0.0:55555}"
 PKG_AUTHOR="${PKG_AUTHOR:-VPM Shop}"
 API_USER="${GEN_USER}"
 API_PASS="${GEN_PASS}"
 EOF
   echo "==> Generated $CONF (API_USER=$GEN_USER, API_PASS=$GEN_PASS)"
-  echo "    Edit $CONF to change credentials/URLs, then run ./launch.sh again."
+  echo "    Edit $CONF to set MASTER_HOST (your public repo URL), credentials, then run ./launch.sh again."
 fi
+
+
+
+
+
+
+
+
+
 
 if [[ -f "$CONF" ]]; then
   set -a
@@ -69,6 +78,23 @@ if [[ -f "$CONF" ]]; then
   source "$CONF"
   set +a
 fi
+
+BIND="${BIND:-0.0.0.0:55555}"
+
+# Always stop any existing vpm-upload-api bound to our port before launching
+# (works for both background and foreground runs, no pid file needed).
+PORT="${BIND##*:}"
+echo "==> Stopping any process on port $PORT ..."
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+else
+  # no fuser — fall back to ss to find and kill listeners on the port
+  for pid in $(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do
+    kill "$pid" 2>/dev/null || true
+  done
+fi
+# give the port time to free up
+sleep 1
 
 # Create the default shop directory if it doesn't exist yet.
 mkdir -p "${VPM_SHOP:-./mnt/shop}"
@@ -81,7 +107,6 @@ echo "==> Building vpm-upload-api ..."
   ./build.sh
 #fi
 
-BIND="${BIND:-0.0.0.0:55555}"
 echo "==> Launching vpm-upload-api (listening on $BIND)"
 mkdir -p logs
 

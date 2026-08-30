@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy this file to repos.conf (gitignored) and set your real domain / author. The category list below is editable — add, remove, or rename entries and rerun regen (it runs on every upload).",
+
+  "master_host": "https://vpm-master.vpm.com",
+  "subdomain_host": "https://vpm-{sub}.vpm.com",
+
+  "author": "VPM Shop",
+  "master_name": "VPM Shop – Master",
+  "master_id": "com.example.vpm.master",
+
+  "categories": [
+    { "name": "Avatars",         "sub": "avatars",         "repo_name": "VPM – Avatars",         "repo_id": "com.vpm.avatars" },
+    { "name": "BetterAugments",  "sub": "BA",              "repo_name": "VPM – BetterAugments",  "repo_id": "com.vpm.BetterAugments" },
+    { "name": "Shaders",         "sub": "shaders",         "repo_name": "VPM – Shaders",         "repo_id": "com.vpm.shaders" },
+    { "name": "Tools",           "sub": "tools",           "repo_name": "VPM – Tools",           "repo_id": "com.vpm.tools" },
+    { "name": "Props",           "sub": "props",           "repo_name": "VPM – Props",           "repo_id": "com.vpm.props" },
+    { "name": "Animations",      "sub": "animations",      "repo_name": "VPM – Animations",      "repo_id": "com.vpm.animations" },
+    { "name": "Models3D",        "sub": "models3d",        "repo_name": "VPM – Models3D",        "repo_id": "com.vpm.models3d" },
+    { "name": "PracticalAssets", "sub": "pa",              "repo_name": "VPM – PA",              "repo_id": "com.vpm.PA" },
+    { "name": "Misc",            "sub": "misc",            "repo_name": "VPM – Misc",            "repo_id": "com.vpm.misc" },
+    { "name": "H20",             "sub": "h20",             "repo_name": "VPM – H20",             "repo_id": "com.vpm.h20" }
+  ]
+}

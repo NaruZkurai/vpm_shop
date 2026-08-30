@@ -35,32 +35,131 @@ struct Config {
     username: String,
     password: String,
     master_host: String,
+    vault_host: String,
     categories: Vec<String>,
+    /// Editable repo metadata (names + url-ids) backed by repos.conf. The
+    /// on-disk file is the source of truth for gen_category_repos.py; the
+    /// /api/repos editor reads/writes it directly.
+    repos_conf_path: PathBuf,
 }
 
-/// The fallback category list, written to `<shop>/categories.txt` on first run
-/// so it can be edited by hand.
-fn default_categories() -> Vec<String> {
-    vec![
-        "Avatars".to_string(),
-        "BetterPB".to_string(),
-        "Shaders".to_string(),
-        "Tools".to_string(),
-        "Props".to_string(),
-        "Animations".to_string(),
-        "Models3D".to_string(),
-        "PointlessAssets".to_string(),
-        "Misc".to_string(),
-    ]
+/// One editable category's per-repo metadata from repos.conf.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct RepoCategory {
+    name: String,
+    sub: String,
+    repo_name: String,
+    repo_id: String,
 }
 
-/// Read categories from `<shop>/categories.txt` (one per line), falling back to
-/// the built-in defaults when the file doesn't exist yet. Categories live in a
-/// file (not a const) so they're mutable at runtime.
-fn load_categories(shop: &Path) -> Result<Vec<String>> {
+/// The editable fields of repos.conf relevant to the web UI.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct RepoConf {
+    master_host: String,
+    subdomain_host: String,
+    author: String,
+    master_name: String,
+    master_id: String,
+    categories: Vec<RepoCategory>,
+}
+
+/// Build a default repo-category entry for a category name. Used when
+/// repos.conf is missing or doesn't yet list the category.
+fn default_repo_category(name: &str) -> RepoCategory {
+    let sub = name.to_lowercase();
+    RepoCategory {
+        name: name.to_string(),
+        sub: sub.clone(),
+        repo_name: format!("VPM – {name}"),
+        repo_id: format!("com.vpm.{sub}"),
+    }
+}
+
+/// Load repos.conf into a RepoConf. When the file is missing it falls back to
+/// safe defaults derived from the editable category names (mirroring how
+/// categories.txt behaves), so a fresh checkout still serves a working editor.
+fn load_repo_conf(path: &Path, default_cats: &[String]) -> Result<RepoConf> {
+    if !path.is_file() {
+        // No repos.conf yet — empty display/domain fields (no fabricated
+        // example.com values). master_host stays empty so callers can detect
+        // that it's unset and refuse to publish rather than guess a URL.
+        return Ok(RepoConf {
+            master_host: String::new(),
+            subdomain_host: String::new(),
+            author: String::new(),
+            master_name: String::new(),
+            master_id: String::new(),
+            categories: default_cats
+                .iter()
+                .map(|c| default_repo_category(c))
+                .collect(),
+        });
+    }
+    let txt = fs::read_to_string(path)
+        .with_context(|| format!("cannot read repos.conf {}", path.display()))?;
+    let v: Value = serde_json::from_str(&txt)
+        .with_context(|| format!("cannot parse repos.conf {}", path.display()))?;
+
+    let g = |k: &str, d: &str| -> String {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or(d).to_string()
+    };
+
+    let mut categories: Vec<RepoCategory> = Vec::new();
+    if let Some(arr) = v.get("categories").and_then(|x| x.as_array()) {
+        for c in arr {
+            let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("Misc");
+            let sub = c.get("sub").and_then(|x| x.as_str()).unwrap_or("misc");
+            categories.push(RepoCategory {
+                name: name.to_string(),
+                sub: sub.to_string(),
+                repo_name: c
+                    .get("repo_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(&format!("VPM – {name}"))
+                    .to_string(),
+                repo_id: c
+                    .get("repo_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    // Ensure every editable category name appears (e.g. categories.txt grew).
+    for c in default_cats {
+        if !categories.iter().any(|rc| &rc.name == c) {
+            categories.push(default_repo_category(c));
+        }
+    }
+
+    Ok(RepoConf {
+        master_host: g("master_host", ""),
+        subdomain_host: g("subdomain_host", ""),
+        author: g("author", ""),
+        master_name: g("master_name", "VPM Shop – Master"),
+        master_id: g("master_id", ""),
+        categories,
+    })
+}
+
+/// Read categories from `<shop>/categories.txt` (one per line). Categories are
+/// file-driven only — no hardcoded fallback list. When the file is missing it
+/// is created from `conf_cats` (the category names in repos.conf), so the shop
+/// derives its category list from config instead of a hardcoded default.
+fn load_categories(shop: &Path, conf_cats: &[String]) -> Result<Vec<String>> {
     let path = shop.join("categories.txt");
     if !path.exists() {
-        return Ok(default_categories());
+        if conf_cats.is_empty() {
+            bail!(
+                "no categories file {} and no categories in repos.conf — add a 'categories' entry or create the file",
+                path.display()
+            );
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, conf_cats.join("\n") + "\n")
+            .with_context(|| format!("cannot write categories file {}", path.display()))?;
     }
     let txt = fs::read_to_string(&path)
         .with_context(|| format!("cannot read categories file {}", path.display()))?;
@@ -85,25 +184,65 @@ fn env_or(key: &str, default: &str) -> String {
     }
 }
 
+/// Make a path absolute relative to the current dir, without requiring it to
+/// exist yet. Falls back to the raw path if the process cwd is unreachable.
+fn absolutize(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
 impl Config {
     fn from_env() -> Result<Config> {
-        let shop = PathBuf::from(env_or("VPM_SHOP", "./mnt/shop"));
-        let validator = PathBuf::from(env_or("VALIDATOR", "./validator/vpmval.dll"));
-        let master_host = env_or("MASTER_HOST", "https://vpm.example.com");
+        // Resolve shop/validator to absolute paths up front. Keeping them
+        // relative ties every later path (incl. run_regen's current_dir +
+        // VPM_SHOP env) to the process cwd, which breaks when the binary is
+        // launched from anywhere but the repo root.
+        let shop = absolutize(&PathBuf::from(env_or("VPM_SHOP", "./mnt/shop")));
+        let validator = absolutize(&PathBuf::from(env_or("VALIDATOR", "./validator/vpmval.dll")));
+        let repos_conf_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("repos.conf");
+        // Derive fallback category names from repos.conf so categories.txt can
+        // be created from config on first run (no hardcoded category list).
+        let conf_cats = match load_repo_conf(&repos_conf_path, &[]) {
+            Ok(rc) => rc.categories.iter().map(|c| c.name.clone()).collect(),
+            Err(_) => Vec::new(),
+        };
+        let categories = load_categories(&shop, &conf_cats)?;
+        // MASTER_HOST comes from the env, else from repos.conf (the source of
+        // truth for gen_category_repos.py). No fabricated default: if neither
+        // provides it, refuse to start rather than publish under a fake URL.
+        let conf_master = load_repo_conf(&repos_conf_path, &categories)
+            .map(|rc| rc.master_host)
+            .unwrap_or_default();
+        let master_host = match env::var("MASTER_HOST") {
+            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ if !conf_master.trim().is_empty() => conf_master.trim().to_string(),
+            _ => bail!(
+                "MASTER_HOST is not set — set it in vpm-shop.conf (or repos.conf \"master_host\") before publishing"
+            ),
+        };
         // Credentials are NOT hardcoded. They must come from the environment
         // (vmp-shop.conf, loaded by ./launch.sh, provides them).
         let username = env::var("API_USER")
             .context("API_USER is not set — run ./launch.sh to generate vpm-shop.conf")?;
         let password = env::var("API_PASS")
             .context("API_PASS is not set — run ./launch.sh to generate vpm-shop.conf")?;
-        let categories = load_categories(&shop)?;
+        // No fabricated vault URL either — leave empty when unset; the UI
+        // simply won't show the link.
+        let vault_host = env::var("VAULT_HOST").unwrap_or_default();
         Ok(Config {
             shop,
             validator,
             username,
             password,
             master_host,
+            vault_host,
             categories,
+            repos_conf_path,
         })
     }
 }
@@ -113,11 +252,6 @@ impl Config {
 /// without manual setup.
 fn bootstrap_shop(cfg: &Config) -> Result<()> {
     fs::create_dir_all(&cfg.shop)?;
-    // Write the editable categories file on first run so it can be customized.
-    let cat_file = cfg.shop.join("categories.txt");
-    if !cat_file.exists() {
-        fs::write(&cat_file, default_categories().join("\n") + "\n")?;
-    }
     for cat in &cfg.categories {
         fs::create_dir_all(cfg.shop.join("VPM").join(cat))?;
     }
@@ -140,6 +274,22 @@ fn scratch_dir(tag: &str) -> PathBuf {
     let base = env::temp_dir().join(format!("vpm-upload-{tag}-{}-{n}", std::process::id()));
     fs::create_dir_all(&base).ok();
     base
+}
+
+/// Move a file into place, falling back to copy+delete when the source and
+/// destination live on different filesystems (EXDEV, os error 18). This allows
+/// scratch files under /tmp to be moved into the shop dir even when /tmp is a
+/// separate mount.
+fn move_path(src: &Path, dst: &Path) -> Result<()> {
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(18) => {
+            fs::copy(src, dst)?;
+            let _ = fs::remove_file(src);
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ─── HTTP layer ─────────────────────────────────────────────────────────────
@@ -169,7 +319,10 @@ async fn main() {
         .route("/api/checklist", get(api_checklist_get))
         .route("/api/checklist", post(api_checklist_save))
         .route("/api/categories", get(api_categories))
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024)) // 10 GiB ceiling
+        .route("/api/config", get(api_config))
+        .route("/api/repos", get(api_repos_get))
+        .route("/api/repos", post(api_repos_save))
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024 * 1024)) // 100 GiB ceiling
         .with_state(cfg);
 
     let addr = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:55555".into());
@@ -473,6 +626,114 @@ async fn api_packages(State(cfg): State<Arc<Config>>) -> Response {
 
 async fn api_categories(State(cfg): State<Arc<Config>>) -> Response {
     json_response(json!(cfg.categories))
+}
+
+/// GET /api/config — resolved run-time URLs (master repo + optional vault),
+/// so the UI doesn't hardcode example.com hosts.
+async fn api_config(State(cfg): State<Arc<Config>>) -> Response {
+    json_response(json!({
+        "master_url": cfg.master_host,
+        "vault_url": cfg.vault_host,
+        "master_repo_url": format!("{}/index.json", cfg.master_host.trim_end_matches('/')),
+    }))
+}
+
+// ─── Repo metadata editor (repos.conf) ─────────────────────────────────────
+
+/// GET /api/repos — return the editable repo metadata (master name/id + each
+/// category's repo_name/repo_id) so the UI can render an editor. Re-read from
+/// disk each call so the UI always reflects the saved state.
+async fn api_repos_get(State(cfg): State<Arc<Config>>) -> Response {
+    match load_repo_conf(&cfg.repos_conf_path, &cfg.categories) {
+        Ok(rc) => json_response(json!({
+            "master_name": rc.master_name,
+            "master_id": rc.master_id,
+            "categories": rc.categories,
+        })),
+        Err(e) => err_response(&format!("{e:#}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RepoCategoryUpdate {
+    name: String,
+    #[serde(default)]
+    repo_name: Option<String>,
+    #[serde(default)]
+    repo_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReposUpdate {
+    #[serde(default)]
+    master_name: Option<String>,
+    #[serde(default)]
+    master_id: Option<String>,
+    #[serde(default)]
+    categories: Vec<RepoCategoryUpdate>,
+}
+
+/// POST /api/repos — update master name/id and per-category repo_name/repo_id,
+/// write the result back to repos.conf, then regenerate the category repos so
+/// the new names/ids take effect in the published vpm-repo.json files.
+async fn api_repos_save(
+    State(cfg): State<Arc<Config>>,
+    axum::Json(body): axum::Json<ReposUpdate>,
+) -> Response {
+    match run_repos_save(&cfg, &body) {
+        Ok(msg) => json_response(json!({ "ok": true, "message": msg })),
+        Err(e) => err_response(&format!("{e:#}")),
+    }
+}
+
+fn run_repos_save(cfg: &Config, body: &ReposUpdate) -> Result<String> {
+    let path = &cfg.repos_conf_path;
+    // Keep any fields we don't edit (master_host, subdomain_host, author, sub):
+    // read the existing file, mutate only the editable keys, write it back.
+    let mut v: Value = if path.is_file() {
+        serde_json::from_str(&fs::read_to_string(path)?)
+            .with_context(|| format!("cannot parse repos.conf {}", path.display()))?
+    } else {
+        json!({ "categories": [] })
+    };
+    if let Some(mn) = &body.master_name {
+        if !mn.trim().is_empty() {
+            v["master_name"] = json!(mn);
+        }
+    }
+    if let Some(mi) = &body.master_id {
+        if !mi.trim().is_empty() {
+            v["master_id"] = json!(mi);
+        }
+    }
+    let cats = v
+        .get_mut("categories")
+        .and_then(|c| c.as_array_mut())
+        .ok_or_else(|| anyhow!("repos.conf has no 'categories' array"))?;
+    for update in &body.categories {
+        let Some(entry) = cats
+            .iter_mut()
+            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(&update.name))
+        else {
+            continue;
+        };
+        if let Some(rn) = &update.repo_name {
+            if !rn.trim().is_empty() {
+                entry["repo_name"] = json!(rn);
+            }
+        }
+        if let Some(ri) = &update.repo_id {
+            if !ri.trim().is_empty() {
+                entry["repo_id"] = json!(ri);
+            }
+        }
+    }
+    let tmp = path.with_extension("conf.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(&v)?)?;
+    fs::rename(&tmp, path)?;
+    // Regenerate the category repos with the new names/ids.
+    let regen = run_regen(&cfg.shop)?;
+    Ok(format!("Saved repos.conf and regenerated category repos.\n{regen}"))
 }
 
 // ─── Private checklist (password-protected personal notes) ─────────────────
@@ -1089,7 +1350,8 @@ async fn run_upload(
     }
 
     // 4c. Move the validated zip into its final place.
-    fs::rename(&tmp_zip, &zip_path)?;
+    //     Use move_path so /tmp (scratch) -> shop cross-filesystem works (EXDEV).
+    move_path(&tmp_zip, &zip_path)?;
     let zip_sha = sha256_file(&zip_path)?;
 
     // 5. Update the master repo
@@ -1381,7 +1643,31 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<String> {
 }
 
 fn run_regen(shop: &Path) -> Result<String> {
-    run_cmd_in("python3", &["gen_category_repos.py"], Some(shop), Some(shop))
+    // The category-repo generator is bundled with this crate (see src/python/).
+    // It writes into the shop (cwd + VPM_SHOP env), auto-creating any missing
+    // category VPM/ subdirs, and reads its domain/category settings from the
+    // gitignored repos.conf (REPOS_CONF), falling back to safe defaults.
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/python/gen_category_repos.py");
+    if !script.is_file() {
+        bail!(
+            "bundled category-repo generator missing: {} — regenerate master repo by hand",
+            script.display()
+        );
+    }
+    let conf = Path::new(env!("CARGO_MANIFEST_DIR")).join("repos.conf");
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script)
+        .current_dir(shop)
+        .env("VPM_SHOP", shop)
+        .env("REPOS_CONF", &conf);
+    let out = cmd.output().with_context(|| "failed to run gen_category_repos.py")?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !out.status.success() {
+        bail!("gen_category_repos.py exited {}:\n{stdout}\n{stderr}", out.status);
+    }
+    Ok(format!("{stdout}\n{stderr}").trim().to_string())
 }
 
 fn run_cmd_in(
@@ -1488,15 +1774,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
   --red:#f85149; --yellow:#d29922; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
-header { display:flex; align-items:center; gap:16px; padding:12px 24px; background:var(--bg2); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10; }
+html, body { height:100%; }
+body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; display:flex; flex-direction:column; }
+header { display:flex; align-items:center; gap:16px; padding:12px 24px; background:var(--bg2); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10; flex:0 0 auto; }
 header h1 { font-size:18px; margin:0; }
 header .sub { color:var(--muted); font-size:12px; margin-top:2px; }
 .tabs { display:flex; gap:6px; margin-left:auto; }
 .tab { padding:6px 14px; border:1px solid var(--border); border-radius:6px; background:var(--bg3); color:var(--muted); cursor:pointer; font-size:13px; }
 .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-main { width:100%; max-width:none; margin:0 auto; padding:4px 8px; box-sizing:border-box; }
-.card { display: flex; flex-direction: column; background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:4px 8px; margin-bottom:8px; }
+main { flex:1 1 auto; min-height:0; width:100%; max-width:none; margin:0 auto; padding:4px 8px; box-sizing:border-box; display:flex; flex-direction:column; }
+.card { display: flex; flex-direction: column; background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:4px 8px; margin-bottom:8px; min-height:0; overflow:hidden; }
 .card h2 { margin:0 0 8px; font-size:16px; }
 .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 @media(max-width:800px){ .grid{grid-template-columns:1fr;} }
@@ -1513,8 +1800,8 @@ button.ghost { background:transparent; border:1px solid var(--border); color:var
 .warn-box { margin-top:12px; padding:10px 14px; border-radius:6px; background:#2d2417; border:1px solid #8e6a3f; color:#f0c98a; font-size:13px; line-height:1.5; }
 .warn-box .muted { color:var(--muted); font-size:12px; }
 .warn-box code { background:rgba(0,0,0,.35); padding:1px 5px; border-radius:4px; }
-.layout { display:grid; grid-template-columns:300px 1fr; gap:20px; }
-@media(max-width:900px){ .layout{grid-template-columns:1fr;} }
+.layout { flex:1 1 auto; min-height:0; display:grid; grid-template-columns:300px 1fr; grid-template-rows:minmax(0,1fr); gap:20px; }
+@media(max-width:900px){ .layout{grid-template-columns:1fr; grid-template-rows:auto auto;} }
 .pkg-list { flex: 1; overflow-y: auto; }
 .pkg-item { padding:6px 8px; border:1px solid var(--border); border-radius:4px; margin-bottom:4px; cursor:pointer; background:var(--bg); }
 .pkg-item:hover { border-color:var(--accent); }
@@ -1586,12 +1873,13 @@ a { color:var(--accent); text-decoration:none; }
 <header>
   <div>
     <h1>🛒 VPM Shop Manager</h1>
-    <div class="sub"> <button class="ghost" id="btn-nav-upload" onclick="openUploadModal()">upload</button> · <button class="ghost" id="btn-nav-browse" onclick="loadPackages()">browse</button> · <button class="ghost" id="btn-nav-registry" onclick="showRegistry()">inspect registry</button> · <button class="ghost" id="btn-nav-vault" onclick="openVault()">vault</button> </div>
+    <div class="sub"> <button class="ghost" id="btn-nav-upload" onclick="openUploadModal()">upload</button> · <button class="ghost" id="btn-nav-browse" onclick="loadPackages()">browse</button> · <button class="ghost" id="btn-nav-registry" onclick="showRegistry()">inspect registry</button> · <button class="ghost" id="btn-nav-repos" onclick="openRepos()">repos</button> · <button class="ghost" id="btn-nav-vault" onclick="openVault()">vault</button> </div>
   </div>
   <div class="tabs">
     <button class="tab active" data-tab="browse">Browse</button>
     <button class="tab" data-tab="upload">Upload</button>
     <button class="tab" data-tab="checklist">Checklist</button>
+    <button class="tab" data-tab="repos">Repos</button>
   </div>
 </header>
 <main>
@@ -1642,6 +1930,27 @@ a { color:var(--accent); text-decoration:none; }
     </div>
   </section>
 
+  <!-- REPOS TAB -->
+  <section id="tab-repos" class="hidden">
+    <div class="card" style="max-width:820px">
+      <h2>🗂 Repo metadata</h2>
+      <p class="muted" style="margin:0 0 4px">Edit the display name and URL id used by each category repo. Save writes <code>repos.conf</code> and regenerates the category listings.</p>
+      <div id="repos-msg" class="warn-box hidden"></div>
+      <div class="toolbar" style="margin-top:8px">
+        <button id="repos-save">💾 Save &amp; regen</button>
+        <span class="muted" id="repos-saved-hint" style="font-size:11px"></span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0">
+        <div><label>Master display name</label><input id="repos-master-name" autocomplete="off" spellcheck="false"></div>
+        <div><label>Master id</label><input id="repos-master-id" autocomplete="off" spellcheck="false"></div>
+      </div>
+      <div class="dep-head-row" style="display:grid;grid-template-columns:1fr 1.4fr 1.4fr;gap:6px">
+        <span>category</span><span>repo name</span><span>repo url-id</span>
+      </div>
+      <div id="repos-rows"></div>
+    </div>
+  </section>
+
   <!-- UPLOAD MODAL -->
   <div id="upload-modal" class="modal hidden">
     <div class="modal-back" onclick="closeUploadModal()"></div>
@@ -1686,9 +1995,8 @@ a { color:var(--accent); text-decoration:none; }
   </div>
 </main>
 <script>
-const repoUrl = 'https://vpm.example.com';
-const vaultUrl = 'https://vault.example.com';
 const $ = s => document.querySelector(s);
+let CONFIG = { master_url: '', vault_url: '' };
 let PACKAGES = {};
 let currentPkg = null, currentVer = null;
 
@@ -1711,11 +2019,13 @@ document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () =>
   t.classList.add('active');
   $('#tab-browse').classList.toggle('hidden', t.dataset.tab !== 'browse');
   $('#tab-checklist').classList.toggle('hidden', t.dataset.tab !== 'checklist');
+  $('#tab-repos').classList.toggle('hidden', t.dataset.tab !== 'repos');
   if (t.dataset.tab === 'upload') openUploadModal();
   if (t.dataset.tab === 'checklist') {
     if (CL.pass) loadChecklist();
     else $('#cl-password').focus();
   }
+  if (t.dataset.tab === 'repos') openRepos();
 }));
 
 // ── private checklist ──
@@ -2204,13 +2514,77 @@ $('#upload-form').addEventListener('submit', async (e) => {
 $('#pkg-search').addEventListener('input', renderList);
 
 loadCategories();
+fetch('/api/config').then(r => r.json()).then(j => { CONFIG = j || CONFIG; }).catch(() => {});
 loadPackages();
 
 function showRegistry() {
-  window.open(repoUrl, '_blank');
+  if (CONFIG.master_repo_url) window.open(CONFIG.master_repo_url, '_blank');
 }
 function openVault() {
-  window.open(vaultUrl, '_blank');
+  if (CONFIG.vault_url) window.open(CONFIG.vault_url, '_blank');
 }
+
+// ── repo metadata editor (repos.conf) ──
+let REPOS = null;
+async function openRepos() {
+  const r = await fetch('/api/repos');
+  const j = await r.json();
+  const msg = $('#repos-msg');
+  if (!r.ok) {
+    msg.classList.remove('hidden');
+    msg.textContent = j.error || 'failed to load repo metadata';
+    return;
+  }
+  msg.classList.add('hidden');
+  REPOS = j;
+  $('#repos-master-name').value = j.master_name || '';
+  $('#repos-master-id').value = j.master_id || '';
+  $('#repos-rows').innerHTML = (j.categories || []).map((c, i) => `
+    <div class="dep-row" style="grid-template-columns:1fr 1.4fr 1.4fr">
+      <input class="rep-cat" value="${esc(c.name)}" readonly title="category name (fixed)">
+      <input class="rep-name" value="${esc(c.repo_name || '')}" data-i="${i}" autocomplete="off" spellcheck="false" placeholder="repo name">
+      <input class="rep-id" value="${esc(c.repo_id || '')}" data-i="${i}" autocomplete="off" spellcheck="false" placeholder="com.author.repo">
+    </div>`).join('');
+}
+function saveRepos() {
+  const cats = (REPOS.categories || []).map((c, i) => {
+    const nameEls = document.querySelectorAll('.rep-name');
+    const idEls = document.querySelectorAll('.rep-id');
+    return {
+      name: c.name,
+      repo_name: (nameEls[i] ? nameEls[i].value : c.repo_name || '').trim(),
+      repo_id: (idEls[i] ? idEls[i].value : c.repo_id || '').trim(),
+    };
+  });
+  const payload = {
+    master_name: $('#repos-master-name').value.trim(),
+    master_id: $('#repos-master-id').value.trim(),
+    categories: cats,
+  };
+  const hint = $('#repos-saved-hint');
+  hint.textContent = 'saving…';
+  $('#repos-msg').classList.add('hidden');
+  fetch('/api/repos', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(async r => {
+    const j = await r.json();
+    if (j.ok) {
+      hint.textContent = 'saved ✓';
+      await openRepos();
+      setTimeout(() => hint.textContent = '', 2500);
+    } else {
+      hint.textContent = j.error || 'save failed';
+      $('#repos-msg').classList.remove('hidden');
+      $('#repos-msg').textContent = (j.error || 'save failed') + ' (category repos were not regenerated)';
+    }
+  }).catch(() => {
+    hint.textContent = 'error';
+    $('#repos-msg').classList.remove('hidden');
+    $('#repos-msg').textContent = 'Network error saving repo metadata';
+  });
+}
+$('#repos-save').onclick = saveRepos;
 </script>
 </body></html>"#;

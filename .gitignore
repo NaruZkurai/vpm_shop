@@ -7,6 +7,9 @@
 # Config file with real URLs/credentials (use vpm-shop.conf.example as a template)
 /vpm-shop.conf
 
+# Category-repo config — holds personal domains (use repos.conf.example as a template)
+/repos.conf
+
 # Personal to-upload notes / shop data — never commit
 /.checklist.json
 
