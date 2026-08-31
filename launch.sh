@@ -25,8 +25,9 @@ NEWTAB=0
 case "${1:-}" in
   "" ) ;;
   -b|--background ) BACKGROUND=1 ;;
-  -h|--help ) usage; exit 0 ;; 
+  -h|--help ) usage; exit 0 ;;
   -nt|--newtab ) NEWTAB=1 ;;
+  -r|--release ) RELEASE_HW=1 ;;
   * )
     echo "Unknown option: $1" >&2
     usage >&2
@@ -64,14 +65,6 @@ EOF
 fi
 
 
-
-
-
-
-
-
-
-
 if [[ -f "$CONF" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -79,7 +72,28 @@ if [[ -f "$CONF" ]]; then
   set +a
 fi
 
+
+
+# Create the default shop directory if it doesn't exist yet.
+mkdir -p "${VPM_SHOP:-./mnt/shop}"
+mkdir -p logs
+
+
+
+
+BIN="target/release/vpm-upload-api"
+
+#if [[ ! -x "$BIN" ]]; then
+echo "==> Building vpm-upload-api ..."
+  ./build.sh
+#fi
+if [[ "$RELEASE_HW"]]; then
+ systemctl stop vpm-shop.service;
+ systemctl enable vpm-shop.service;
+fi
+echo "==> Launching vpm-upload-api (listening on $BIND)"
 BIND="${BIND:-0.0.0.0:55555}"
+URL="http://localhost:${BIND##*:}/"
 
 # Always stop any existing vpm-upload-api bound to our port before launching
 # (works for both background and foreground runs, no pid file needed).
@@ -93,25 +107,11 @@ else
     kill "$pid" 2>/dev/null || true
   done
 fi
-# give the port time to free up
-sleep 1
 
-# Create the default shop directory if it doesn't exist yet.
-mkdir -p "${VPM_SHOP:-./mnt/shop}"
-
-BIN="target/release/vpm-upload-api"
-
-#if [[ ! -x "$BIN" ]]; then
-#  echo "==> Binary not found, running ./build.sh first ..."
-echo "==> Building vpm-upload-api ..." 
-  ./build.sh
-#fi
-
-echo "==> Launching vpm-upload-api (listening on $BIND)"
-mkdir -p logs
-
-URL="http://localhost:${BIND##*:}/"
-
+if [[ "$RELEASE_HW"]]; then
+ systemctl start vpm-shop.service;
+ systemctl enable vpm-shop.service;
+else
 # launch browser tab flag — open after server is up
 if [[ "$NEWTAB" == "1" ]]; then
   open_browser() {
@@ -125,6 +125,7 @@ if [[ "$NEWTAB" == "1" ]]; then
   }
 else
   open_browser() { :; }
+fi
 fi
 
 if [[ "$BACKGROUND" == "1" ]]; then
