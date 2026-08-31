@@ -22,6 +22,7 @@ cd "$(dirname "$0")"
 # --- parse args -----------------------------------------------------------
 BACKGROUND=0
 NEWTAB=0
+RELEASE_HW=0
 case "${1:-}" in
   "" ) ;;
   -b|--background ) BACKGROUND=1 ;;
@@ -83,11 +84,11 @@ mkdir -p logs
 
 BIN="target/release/vpm-upload-api"
 
-#if [[ ! -x "$BIN" ]]; then
+
 echo "==> Building vpm-upload-api ..."
   ./build.sh
 #fi
-if [[ "$RELEASE_HW"]]; then
+if [[ "$RELEASE_HW" == "1" ]]; then
  systemctl stop vpm-shop.service;
  systemctl enable vpm-shop.service;
 fi
@@ -108,7 +109,7 @@ else
   done
 fi
 
-if [[ "$RELEASE_HW"]]; then
+if [[ "$RELEASE_HW" == "1" ]]; then
  systemctl start vpm-shop.service;
  systemctl enable vpm-shop.service;
 else
