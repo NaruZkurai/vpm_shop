@@ -18,3 +18,5 @@
 
 # Compiled VCC validator (.NET) — build/deploy artifact, not source
 /validator
+
+/.vscode
